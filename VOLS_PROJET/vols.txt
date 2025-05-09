@@ -1,4 +1,4 @@
-1000 Paris 3 500
-2000 London 10 2500
+1000 Paris 5 500
+2000 London 3 2500
 3000 Moscow 40 1000
-4000 Tokyo 10 3000
+4000 Tokyo 1 3000

@@ -46,7 +46,6 @@ void replay_history() {
         sscanf(line, "%d %d %s %d %s", &ref, &agency_id, transaction, &value, result);
         
         int flight_idx = -1;
-
         for (int i = 0; i < num_flights; i++) {
             if (flights[i].ref == ref) {
                 flight_idx = i;
@@ -90,7 +89,8 @@ void update_vols() {
         return;
     }
     for (int i = 0; i < num_flights; i++) {
-        fprintf(fp, "%d %s %d %d\n", flights[i].ref, flights[i].destination, flights[i].available_seats, flights[i].price);
+        fprintf(fp, "%d %s %d %d\n", flights[i].ref, flights[i].destination, 
+                flights[i].available_seats, flights[i].price);
     }
     fclose(fp);
 }
@@ -105,7 +105,7 @@ int find_flight_index(int ref) {
     return -1;
 }
 
-// Traite les requêtes des clients dans un thread séparé
+// Traite les requêtes des clients TCP dans un thread séparé
 void* handle_client(void* arg) {
     int client_sock = *(int*)arg;
     free(arg);
@@ -194,58 +194,237 @@ void* handle_client(void* arg) {
     return NULL;
 }
 
-int main() {
-    // Initialisation
-    load_flights();
-    replay_history();
+// Traite les requêtes UDP des agences
+void handle_agency_udp(int agency_sock) {
+    char buffer[256];
+    struct sockaddr_in client_addr;
+    socklen_t client_len = sizeof(client_addr);
+    while (1) {
+        int bytes = recvfrom(agency_sock, buffer, sizeof(buffer) - 1, 0, 
+                            (struct sockaddr*)&client_addr, &client_len);
+        if (bytes <= 0) continue;
+        buffer[bytes] = '\0';
 
-    // Configuration du socket serveur
-    int server_sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_sock < 0) {
-        perror("Erreur lors de la création du socket");
-        exit(EXIT_FAILURE);
+        pthread_mutex_lock(&mutex);
+
+        char command[20];
+        sscanf(buffer, "%s", command);
+
+        if (strcmp(command, "RESERVE") == 0 || strcmp(command, "CANCEL") == 0) {
+            int ref, agency_id, value;
+            int parsed = sscanf(buffer + strlen(command), "%d %d %d", &ref, &agency_id, &value);
+            if (parsed != 3) {
+                sendto(agency_sock, "INVALID_COMMAND", 15, 0, 
+                       (struct sockaddr*)&client_addr, client_len);
+                pthread_mutex_unlock(&mutex);
+                continue;
+            }
+
+            FILE *histo_fp = fopen("histo.txt", "a");
+            if (!histo_fp) {
+                sendto(agency_sock, "SERVER_ERROR", 12, 0, 
+                       (struct sockaddr*)&client_addr, client_len);
+                pthread_mutex_unlock(&mutex);
+                continue;
+            }
+
+            int flight_idx = find_flight_index(ref);
+            if (strcmp(command, "RESERVE") == 0) {
+                if (flight_idx != -1 && flights[flight_idx].available_seats >= value) {
+                    flights[flight_idx].available_seats -= value;
+                    total_payments[agency_id] += value * flights[flight_idx].price;
+                    fprintf(histo_fp, "%d %d Demande %d succès\n", ref, agency_id, value);
+                    sendto(agency_sock, "SUCCESS", 7, 0, 
+                           (struct sockaddr*)&client_addr, client_len);
+                    update_vols();
+                } else {
+                    fprintf(histo_fp, "%d %d Demande %d impossible\n", ref, agency_id, value);
+                    sendto(agency_sock, "FAILURE", 7, 0, 
+                           (struct sockaddr*)&client_addr, client_len);
+                }
+            } else { // CANCEL
+                if (flight_idx != -1) {
+                    flights[flight_idx].available_seats += value;
+                    total_payments[agency_id] -= 0.9 * value * flights[flight_idx].price;
+                    fprintf(histo_fp, "%d %d Annulation %d succès\n", ref, agency_id, value);
+                    sendto(agency_sock, "SUCCESS", 7, 0, 
+                           (struct sockaddr*)&client_addr, client_len);
+                    update_vols();
+                } else {
+                    sendto(agency_sock, "FAILURE", 7, 0, 
+                           (struct sockaddr*)&client_addr, client_len);
+                }
+            }
+            fclose(histo_fp);
+        } else if (strcmp(command, "INVOICE") == 0) {
+            int agency_id;
+            int parsed = sscanf(buffer + strlen(command), "%d", &agency_id);
+            if (parsed != 1) {
+                sendto(agency_sock, "INVALID_COMMAND", 15, 0, 
+                       (struct sockaddr*)&client_addr, client_len);
+                pthread_mutex_unlock(&mutex);
+                continue;
+            }
+            char response[50];
+            snprintf(response, sizeof(response), "INVOICE %.2f", total_payments[agency_id]);
+            sendto(agency_sock, response, strlen(response), 0, 
+                   (struct sockaddr*)&client_addr, client_len);
+        } else if (strcmp(command, "CONSULT") == 0) {
+            char response[8192] = "";
+            for (int i = 0; i < num_flights; i++) {
+                char flight_info[256];
+                snprintf(flight_info, sizeof(flight_info), "%d %s %d %d\n",
+                         flights[i].ref, flights[i].destination,
+                         flights[i].available_seats, flights[i].price);
+                strcat(response, flight_info);
+            }
+            sendto(agency_sock, response, strlen(response), 0, 
+                   (struct sockaddr*)&client_addr, client_len);
+        } else {
+            sendto(agency_sock, "UNKNOWN_COMMAND", 15, 0, 
+                   (struct sockaddr*)&client_addr, client_len);
+        }
+
+        update_facture();
+        pthread_mutex_unlock(&mutex);
     }
+}
 
+// Gère les connexions des agences dans un thread séparé
+void* agency_handler(void* arg) {
+    char* protocol = (char*)arg;
+    int agency_sock;
     struct sockaddr_in server_addr;
     server_addr.sin_family = AF_INET;
     server_addr.sin_addr.s_addr = INADDR_ANY;
     server_addr.sin_port = htons(8080);
 
-    if (bind(server_sock, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
-        perror("Erreur lors du bind");
-        exit(EXIT_FAILURE);
+    if (strcmp(protocol, "tcp") == 0) {
+        agency_sock = socket(AF_INET, SOCK_STREAM, 0);
+        if (agency_sock < 0) {
+            perror("Erreur lors de la création du socket TCP");
+            exit(EXIT_FAILURE);
+        }
+        if (bind(agency_sock, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
+            perror("Erreur lors du bind TCP");
+            exit(EXIT_FAILURE);
+        }
+        if (listen(agency_sock, 10) < 0) {
+            perror("Erreur lors du listen TCP");
+            exit(EXIT_FAILURE);
+        }
+        printf("Serveur agence (TCP) démarré sur le port 8080\n");
+
+        while (1) {
+            struct sockaddr_in client_addr;
+            socklen_t client_len = sizeof(client_addr);
+            int* client_sock = malloc(sizeof(int));
+            *client_sock = accept(agency_sock, (struct sockaddr*)&client_addr, &client_len);
+            if (*client_sock < 0) {
+                perror("Erreur lors de l'acceptation");
+                free(client_sock);
+                continue;
+            }
+
+            pthread_t thread;
+            if (pthread_create(&thread, NULL, handle_client, client_sock) != 0) {
+                perror("Erreur lors de la création du thread");
+                close(*client_sock);
+                free(client_sock);
+            } else {
+                pthread_detach(thread);
+            }
+        }
+    } else { // udp
+        agency_sock = socket(AF_INET, SOCK_DGRAM, 0);
+        if (agency_sock < 0) {
+            perror("Erreur lors de la création du socket UDP");
+            exit(EXIT_FAILURE);
+        }
+        if (bind(agency_sock, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
+            perror("Erreur lors du bind UDP");
+            exit(EXIT_FAILURE);
+        }
+        printf("Serveur agence (UDP) démarré sur le port 8080\n");
+        handle_agency_udp(agency_sock);
+    }
+    close(agency_sock);
+    return NULL;
+}
+
+int main() {
+    // Initialisation
+    load_flights();
+    replay_history();
+
+    // Choix du protocole
+    printf("Choisissez le protocole pour les agences (tcp/udp): ");
+    char protocol[10];
+    fgets(protocol, sizeof(protocol), stdin);
+    protocol[strcspn(protocol, "\n")] = 0; // Supprime le retour à la ligne
+
+    if (strcmp(protocol, "tcp") != 0 && strcmp(protocol, "udp") != 0) {
+        printf("Protocole invalide. Utilisation de TCP par défaut.\n");
+        strcpy(protocol, "tcp");
     }
 
-    if (listen(server_sock, 10) < 0) {
-        perror("Erreur lors du listen");
+    // Démarre le gestionnaire des agences dans un thread séparé
+    pthread_t agency_thread;
+    if (pthread_create(&agency_thread, NULL, agency_handler, protocol) != 0) {
+        perror("Erreur lors de la création du thread agence");
         exit(EXIT_FAILURE);
     }
+    pthread_detach(agency_thread);
 
-    printf("Serveur démarré sur le port 8080\n");
-
-    // Boucle d'acceptation des clients
+    // Console admin
     while (1) {
-        struct sockaddr_in client_addr;
-        socklen_t client_len = sizeof(client_addr);
-        int* client_sock = malloc(sizeof(int));
-        *client_sock = accept(server_sock, (struct sockaddr*)&client_addr, &client_len);
-        if (*client_sock < 0) {
-            perror("Erreur lors de l'acceptation");
-            free(client_sock);
-            continue;
-        }
+        printf("Admin> ");
+        char command[100];
+        fgets(command, sizeof(command), stdin);
+        command[strcspn(command, "\n")] = 0;
 
-        pthread_t thread;
-        if (pthread_create(&thread, NULL, handle_client, client_sock) != 0) {
-            perror("Erreur lors de la création du thread");
-            close(*client_sock);
-            free(client_sock);
+        pthread_mutex_lock(&mutex);
+        
+        if (strncmp(command, "flight ", 7) == 0) {
+            int ref;
+            sscanf(command + 7, "%d", &ref);
+            int found = 0;
+            for (int i = 0; i < num_flights; i++) {
+                if (flights[i].ref == ref) {
+                    printf("Vol %d: %s, %d places, %d€/place\n",
+                           ref, flights[i].destination, flights[i].available_seats, 
+                           flights[i].price);
+                    found = 1;
+                    break;
+                }
+            }
+            if (!found) printf("Vol %d non trouvé\n", ref);
+        } else if (strncmp(command, "invoice ", 8) == 0) {
+            int agency_id;
+            sscanf(command + 8, "%d", &agency_id);
+            printf("Facture agence %d: %.2f€\n", agency_id, total_payments[agency_id]);
+        } else if (strcmp(command, "history") == 0) {
+            FILE *fp = fopen("histo.txt", "r");
+            if (fp) {
+                char line[256];
+                while (fgets(line, sizeof(line), fp)) {
+                    printf("%s", line);
+                }
+                fclose(fp);
+            } else {
+                printf("Historique non trouvé\n");
+            }
+        } else if (strcmp(command, "exit") == 0) {
+            pthread_mutex_unlock(&mutex);
+            printf("Arrêt du serveur\n");
+            exit(0);
         } else {
-            pthread_detach(thread);
+            printf("Commande inconnue. Options: flight <ref>, invoice <agency_id>, history, exit\n");
         }
+        
+        pthread_mutex_unlock(&mutex);
     }
 
-    close(server_sock);
     pthread_mutex_destroy(&mutex);
     return 0;
 }
